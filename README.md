@@ -41,6 +41,8 @@ This project was created to simplify the initial reconnaissance phase of securit
 - [x] Batch scanning of multiple URLs
 - [x] Detailed vulnerability reporting
 - [x] Customizable scan depth
+- [x] Non-interactive command-line scraping and scanning
+- [x] Browser-free quick scrape mode with JSON summaries
 - [ ] Authentication support
 - [ ] Custom vulnerability rule definitions
 - [ ] Export to PDF/HTML reports
@@ -90,6 +92,26 @@ Create a file named `UserAgent.txt` in the root directory and add your User-Agen
 
 ```bash
 python main.py
+```
+
+### Non-Interactive Usage
+
+Run a quick browser-free scrape:
+
+```bash
+python main.py scrape --url https://example.com --folder example --depth 1 --mode requests
+```
+
+Run a JavaScript-rendered scrape with Selenium:
+
+```bash
+python main.py scrape --url https://example.com --folder example --depth 1 --mode selenium
+```
+
+Run a single security scan:
+
+```bash
+python main.py scan --url https://example.com
 ```
 
 ### Main Menu Options

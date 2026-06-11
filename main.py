@@ -3,6 +3,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
+import argparse
 import requests
 import os
 import re
@@ -10,10 +11,12 @@ import json
 import hashlib
 import time
 import random
+import sys
 import urllib
 from urllib.parse import urljoin, urlparse
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
 
 
 RED = "\033[91m"
@@ -418,6 +421,74 @@ def create_folder(base_path, folder_name):
     os.makedirs(folder_path, exist_ok=True)
     return folder_path
 
+
+def sanitize_filename(value):
+    value = re.sub(r'[^a-zA-Z0-9._-]+', '_', value).strip('._')
+    return value or "index"
+
+
+def filename_from_url(url, content_type=""):
+    parsed_url = urlparse(url)
+    path = parsed_url.path or "/"
+    basename = os.path.basename(path.rstrip("/"))
+
+    if basename and "." in basename:
+        filename = sanitize_filename(basename)
+    elif path == "/" or not path:
+        filename = "index.html" if "html" in content_type else "index"
+    else:
+        filename = sanitize_filename(path.strip("/").replace("/", "_"))
+        if "html" in content_type or not os.path.splitext(filename)[1]:
+            filename += ".html"
+
+    if parsed_url.query:
+        name, ext = os.path.splitext(filename)
+        query_hash = hashlib.md5(parsed_url.query.encode()).hexdigest()[:8]
+        filename = f"{name}_{query_hash}{ext}"
+
+    return filename
+
+
+def load_user_agents_noninteractive(user_agent_file="UserAgent.txt", num_agents=10):
+    try:
+        with open(user_agent_file, "r") as file:
+            user_agents = [line.strip() for line in file if line.strip()]
+            if user_agents:
+                return user_agents
+    except FileNotFoundError:
+        pass
+
+    return generate_user_agents(num_agents)
+
+
+def collect_asset_urls(soup):
+    asset_selectors = {
+        "css": [link.get("href") for link in soup.find_all("link", href=True) if ".css" in link.get("href")],
+        "js": [script.get("src") for script in soup.find_all("script", src=True)],
+        "images": [img.get("src") for img in soup.find_all("img", src=True)],
+        "videos": [video.get("src") for video in soup.find_all("video", src=True)],
+        "audios": [audio.get("src") for audio in soup.find_all("audio", src=True)],
+        "fonts": [link.get("href") for link in soup.find_all("link", href=True) if "font" in link.get("href")]
+    }
+    return {asset_type: [url for url in urls if url] for asset_type, urls in asset_selectors.items()}
+
+
+def write_scrape_summary(folder, start_url, mode, visited, downloaded, failed):
+    summary = {
+        "start_url": start_url,
+        "mode": mode,
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "pages_visited": len(visited),
+        "downloaded_files": downloaded,
+        "failed_downloads": failed,
+        "visited_urls": sorted(visited)
+    }
+    summary_path = os.path.join(folder, "scrape_summary.json")
+    with open(summary_path, "w") as file:
+        json.dump(summary, file, indent=4)
+    print(f"{GREEN}Scrape summary saved:{RESET} {summary_path}")
+    return summary
+
 def display_security_scan_summary(scan_results):
     print(f"\n{GREEN}Security Scan Results for {scan_results['url']}:{RESET}")
     
@@ -474,8 +545,8 @@ def save_file(url, folder, user_agent, proxy=None, timeout=10, perform_scan=True
         response = requests.get(url, headers=headers, proxies=proxies, timeout=timeout)
 
         if response.status_code == 200:
-            parsed_url = urlparse(url)
-            filename = os.path.basename(parsed_url.path) or "index.html"
+            content_type = response.headers.get("Content-Type", "")
+            filename = filename_from_url(url, content_type)
             filepath = os.path.join(folder, filename)
 
             with open(filepath, "wb") as f:
@@ -485,7 +556,11 @@ def save_file(url, folder, user_agent, proxy=None, timeout=10, perform_scan=True
             logging.info(f"Downloaded: {filepath}")
             
             
-            if perform_scan and filename.endswith(('.html', '.htm', '.php', '.asp', '.aspx', '.jsp')) or not os.path.splitext(filename)[1]:
+            scan_enabled = perform_scan and (
+                filename.endswith(('.html', '.htm', '.php', '.asp', '.aspx', '.jsp'))
+                or not os.path.splitext(filename)[1]
+            )
+            if scan_enabled:
                 print(f"{YELLOW}Performing security scan for: {url}{RESET}")
                 html_content = response.text
                 scan_results = perform_security_scan(url, html_content, response.headers)
@@ -637,6 +712,128 @@ def batch_security_scan():
     except Exception as e:
         print(f"{RED}Error during batch scan: {e}{RESET}")
 
+
+def scrape_website_requests(url, folder_name, depth=0, perform_scan=True, delay=0.2):
+    user_agents = load_user_agents_noninteractive()
+    proxies = load_proxies()
+    base_folder = create_folder("scraped_sites", folder_name)
+    start_netloc = urlparse(url).netloc
+    queue = deque([(url, depth)])
+    visited = set()
+    downloaded = 0
+    failed = []
+
+    while queue:
+        current_url, remaining_depth = queue.popleft()
+        if current_url in visited or remaining_depth < 0:
+            continue
+
+        visited.add(current_url)
+        print(f"\n{YELLOW}Scraping:{RESET} {current_url}")
+        user_agent = random.choice(user_agents)
+
+        try:
+            headers = {"User-Agent": user_agent}
+            response = requests.get(current_url, headers=headers, timeout=10)
+            response.raise_for_status()
+        except Exception as e:
+            failed.append({"url": current_url, "error": str(e)})
+            print(f"{RED}Failed to fetch page:{RESET} {current_url} ({e})")
+            continue
+
+        if save_file(current_url, base_folder, user_agent, perform_scan=perform_scan):
+            downloaded += 1
+        else:
+            failed.append({"url": current_url, "error": "download failed"})
+            continue
+
+        content_type = response.headers.get("Content-Type", "")
+        if "html" not in content_type.lower():
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for asset_type, urls in collect_asset_urls(soup).items():
+            if not urls:
+                continue
+            print(f"\n{GREEN}Processing {len(urls)} {asset_type} files...{RESET}")
+            asset_folder = create_folder(base_folder, asset_type)
+            for asset_url in urls:
+                full_url = urljoin(current_url, asset_url)
+                if try_with_proxies(full_url, asset_folder, user_agent, proxies, perform_scan=False):
+                    downloaded += 1
+                else:
+                    failed.append({"url": full_url, "error": "asset download failed"})
+
+        if remaining_depth > 0:
+            links = [a.get("href") for a in soup.find_all("a", href=True)]
+            for link in links:
+                full_url = urljoin(current_url, link).split("#")[0]
+                parsed_link = urlparse(full_url)
+                if parsed_link.netloc == start_netloc and full_url not in visited:
+                    queue.append((full_url, remaining_depth - 1))
+
+        if delay:
+            time.sleep(delay)
+
+    return write_scrape_summary(base_folder, url, "requests", visited, downloaded, failed)
+
+
+def run_cli(argv):
+    parser = argparse.ArgumentParser(description="ScorpionV3 web scraper and security scanner")
+    subparsers = parser.add_subparsers(dest="command")
+
+    scrape_parser = subparsers.add_parser("scrape", help="Run a non-interactive scrape")
+    scrape_parser.add_argument("--url", required=True, help="URL to scrape")
+    scrape_parser.add_argument("--folder", required=True, help="Folder name under scraped_sites")
+    scrape_parser.add_argument("--depth", type=int, default=0, help="Recursive crawl depth")
+    scrape_parser.add_argument(
+        "--mode",
+        choices=["requests", "selenium"],
+        default="requests",
+        help="Scrape mode. requests is faster; selenium renders JavaScript pages."
+    )
+    scrape_parser.add_argument(
+        "--no-security-scan",
+        action="store_true",
+        help="Download pages without writing security scan JSON files"
+    )
+
+    scan_parser = subparsers.add_parser("scan", help="Run a non-interactive single URL security scan")
+    scan_parser.add_argument("--url", required=True, help="URL to scan")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "scrape":
+        if args.mode == "requests":
+            scrape_website_requests(
+                args.url,
+                args.folder,
+                depth=args.depth,
+                perform_scan=not args.no_security_scan
+            )
+            return 0
+
+        user_agents = load_user_agents_noninteractive()
+        proxies = load_proxies()
+        base_folder = create_folder("scraped_sites", args.folder)
+        driver = configure_driver()
+        visited = set()
+        try:
+            extract_assets(driver, args.url, base_folder, args.depth, visited, user_agents, proxies)
+            write_scrape_summary(base_folder, args.url, "selenium", visited, "see folder", [])
+            return 0
+        finally:
+            driver.quit()
+
+    if args.command == "scan":
+        user_agents = load_user_agents_noninteractive()
+        output_folder = create_folder("security_scans", "single_scans")
+        success = try_with_proxies(args.url, output_folder, random.choice(user_agents), [], perform_scan=True)
+        return 0 if success else 1
+
+    parser.print_help()
+    return 1
+
 def scrape_website():
     print(f"\n{GREEN}Loading configurations...{RESET}")
     user_agents = load_or_generate_user_agents()
@@ -668,7 +865,11 @@ def scrape_website():
     print(f"\n{GREEN}Scraping completed! Files saved in: {base_folder}{RESET}")
 
 
-def main():
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv:
+        return run_cli(argv)
+
     show_ascii_art()
 
     while True:
@@ -689,7 +890,9 @@ def main():
             break
         else:
             print(f"{RED}Invalid choice. Please try again.{RESET}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    raise SystemExit(main())
